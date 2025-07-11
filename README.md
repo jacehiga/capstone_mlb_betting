@@ -1,6 +1,6 @@
 # MLB Betting Data Acquisition
 
-This is for my capstone project, and highlights the data acquisition I conducted for my MLB Betting analysis. I wrote two scrapers, one that uses selenium to scrape the mlb.com official website and the other that scrapes statsapi. It is an ongoing project that will be fully completed by August 17th.
+This is for my capstone project, and highlights the data acquisition I conducted for my MLB Betting analysis. I wrote two scrapers using python, one utilizes selenium to scrape the mlb.com official website and the other scrapes from the statsapi package. It is an ongoing project that will be fully completed by August 17th.
 ---
 
 ## Connection to Tables
