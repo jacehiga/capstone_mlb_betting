@@ -1,3 +1,4 @@
+# This is a scraper that was written using selenium that scrapes mlb.com for boxscore data
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -23,7 +24,7 @@ driver = webdriver.Chrome(
 wait = WebDriverWait(driver, 10)
 
 # Go to MLB scores page
-url = "https://www.mlb.com/scores/2025-06-10"
+url = "https://www.mlb.com/scores"
 driver.get(url)
 
 # Wait for page to load
