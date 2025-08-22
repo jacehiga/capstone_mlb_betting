@@ -1,0 +1,430 @@
+---
+title: "Data Analysis - Capstone"
+output: html_document
+date: "2025-07-18"
+---
+
+## Installing Packages to Connect to Postgres
+```{r}
+install.packages("DBI")
+install.packages("RPostgres")
+```
+
+## Connecting
+
+```{r cars}
+library(DBI)
+library(RPostgres)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = "switchyard.proxy.rlwy.net",   
+  port = 42251,
+  dbname = "railway",
+  user = "postgres",
+  password = "onfxNlZFioFScuucmNhZKHhzPggcMfvd"
+)
+```
+
+
+## Table List
+``` {r}
+dbListTables(con)
+```
+
+
+## R Libraries
+``` {r}
+library(dplyr)
+library(ggplot2)
+```
+
+```{r}
+games <- dbReadTable(con, "games")
+pitcher_stats <- dbReadTable(con, "pitcher_stats")
+batter_stats <- dbReadTable(con, "batter_stats")
+batter_statcast <- dbReadTable(con, "batter_statcast")
+batter_pitches <- dbReadTable(con, "batter_pitches")
+pitcher_statcast <- dbReadTable(con, "pitcher_statcast")
+pitcher_pitches <- dbReadTable(con, "pitcher_pitches")
+players <- dbReadTable(con, "players")
+sides <- dbReadTable(con, "sides")
+teams <- dbReadTable(con, "teams")
+```
+
+```{r}
+games = games %>%
+  mutate(total_runs = home_score + away_score) %>%
+  mutate(over_8_5 = as.factor(total_runs > 8.5))
+
+games
+```
+
+
+```{r}
+starting_pitchers = pitcher_stats %>%
+  filter(type == "SP")
+
+starting_pitchers = starting_pitchers %>%
+  inner_join(sides, by = c("game_id", "team_id"))
+
+game_with_pitchers = games %>%
+  mutate(
+    total_runs = home_score + away_score,
+    over_8_5 = as.factor(home_score + away_score > 8.5)
+  ) %>%
+  inner_join(starting_pitchers, by = "game_id") %>%
+  filter((side == "home" & team_id == home_team_id) |
+         (side == "away" & team_id == away_team_id))
+
+game_with_pitchers <- game_with_pitchers %>%
+  left_join(pitcher_statcast  %>% select(-era), by = "pitcher_id")
+```
+
+
+```{}
+library(GGally)
+
+gg_df = game_with_pitchers %>%
+  select(over_8_5, era, x_era, ba, x_ba, woba, x_woba, slg, x_slg) %>%
+  na.omit()
+
+ggpairs(gg_df, aes(color = over_8_5, alpha = 0.6))
+```
+
+
+
+
+
+
+## EDA
+
+### LOOKING AT TEAM SCORING DISTRIBUTION
+```{r}
+mean_runs <- mean(model_data$runs_scored, na.rm = TRUE)
+median_runs <- median(model_data$runs_scored, na.rm = TRUE)
+
+mean_runs
+median_runs
+
+
+library(ggplot2)
+
+ggplot(model_data_clean, aes(x = runs_scored)) +
+  geom_histogram(binwidth = 1, fill = "#002D72", color = "black", linewidth = 0.3) +  # Black border
+  labs(
+    title = "Distribution of Team Runs Scored per Game",
+    subtitle = paste("Includes all team-game data from June 21 through now"),
+    x = "Runs Scored",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+
+```
+
+
+
+
+### ANALYZING IMPORTANT FEATURES
+```{r}
+model_data_clean <- na.omit(model_data)
+
+
+mod <- lm(runs_scored ~ sp_era + sp_ba + sp_slg + rp_era + rp_slg + rp_ip + b_ba + b_sum_so + b_ba + b_slg, data = model_data_clean)
+
+
+summary(mod)
+
+```
+
+
+### CORRELATION MATRIX
+```{}
+library(car)
+vif(mod)
+```
+
+
+```{}
+library(ggplot2)
+library(reshape2)
+
+# Step 1: Select your model variables
+heatmap_vars <- model_data_clean %>%
+  select(runs_scored, sp_era, sp_ba, sp_slg, rp_era, rp_slg, rp_ip, 
+         b_ba, b_sum_so, b_slg)
+
+# Step 2: Correlation matrix
+cor_matrix <- cor(heatmap_vars, use = "complete.obs")
+
+# Step 3: Melt for ggplot
+melted_cor <- melt(cor_matrix)
+
+# Step 4: Create the heatmap
+ggplot(melted_cor, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +  # clean, borderless tiles
+  scale_fill_gradient2(low = "#6baed6", high = "#f46d43", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), 
+                       name = "Correlation") +
+  labs(title = "Correlation Heatmap of Final Model Predictors") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) +
+  coord_fixed()
+```
+
+
+
+
+### ML!
+```{r}
+library(tidyverse)
+library(caret) 
+```
+
+
+
+
+
+
+
+### LOOKING AT BA VS XBA
+```{r}
+batter_team_avg = batter_statcast %>%
+  inner_join(players, by = c("batter_id" = "player_id")) %>%
+  inner_join(batter_stats, by = "batter_id") %>%
+  group_by(team_id) %>%
+  summarise(
+    avg_ba = mean(ba, na.rm = TRUE),
+    avg_xba = mean(x_ba, na.rm = TRUE)
+  )
+
+batter_team_avg = batter_team_avg %>%
+  left_join(teams, by = "team_id")
+```
+
+
+```{r}
+ggplot(batter_team_avg, aes(x = avg_xba, y = avg_ba, label = team_name)) +
+  geom_point(color = "#002D72", size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  geom_text(vjust = -0.7, size = 2.5) +  
+  annotate("text", x = 0.22, y = 0.27, label = "Overperforming", size = 4, fontface = "bold", color = "darkgreen") +
+  annotate("text", x = 0.264, y = 0.21, label = "Underperforming", size = 4, fontface = "bold", color = "firebrick3") +
+  labs(
+    title = "Team-Level: Batting Average vs Expected Batting Average",
+    subtitle = paste("Comparing Actual vs. Expected Batting Averages by Team"),
+    x = "Expected Batting Average (xBA)",
+    y = "Actual Batting Average (BA)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  )
+```
+
+
+
+```{r}
+library(tidyverse)
+
+# Step 1: Reshape `games` into long format: one row per team per game
+team_runs <- games %>%
+  pivot_longer(
+    cols = c(home_team_id, away_team_id),
+    names_to = "side",
+    values_to = "team_id"
+  ) %>%
+  mutate(
+    runs_scored = if_else(side == "home_team_id", home_score, away_score),
+    period = case_when(
+      date <= as.Date("2025-07-09") ~ "Before ASB",
+      date >= as.Date("2025-07-18") & date <= as.Date("2025-07-23") ~ "After ASB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(period))
+
+# Step 2: Join with teams table to get team names
+team_runs_named <- team_runs %>%
+  left_join(teams, by = c("team_id"))
+
+# Step 3: Compute average runs scored by team in each period
+avg_runs <- team_runs_named %>%
+  group_by(team_name, period) %>%
+  summarise(
+    avg_runs = mean(runs_scored, na.rm = TRUE),
+    games_played = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(team_name, period)
+
+# View result
+print(avg_runs)
+```
+
+
+
+```{r}
+# Load libraries
+library(tibble)
+library(dplyr)
+
+# Create the data frame using team abbreviations
+before_tbl = tribble(
+  ~team_name, ~avg_runs_before,
+  "CHC", 5.35,
+  "LAD", 5.34,
+  "NYY", 5.26,
+  "ARI", 5.08,
+  "BOS", 5.02,
+  "DET", 4.98,
+  "MIL", 4.73,
+  "TB",  4.67,
+  "SEA", 4.66,
+  "TOR", 4.60,
+  "PHI", 4.59,
+  "STL", 4.57,
+  "CIN", 4.55,
+  "NYM", 4.42,
+  "LAA", 4.39,
+  "HOU", 4.39,
+  "WSH", 4.38,
+  "SAC", 4.24,
+  "MIA", 4.22,
+  "MIN", 4.22,
+  "BAL", 4.17,
+  "SF",  4.14,
+  "ATL", 4.09,
+  "TEX", 4.04,
+  "SD",  4.02,
+  "CLE", 3.69,
+  "COL", 3.52,
+  "CWS", 3.41,
+  "KC",  3.39,
+  "PIT", 3.38
+)
+```
+
+
+
+
+#### LOOKING AT RUN DIFFERENCE BEFORE AND AFTER ALL-STAR BREAK - update as time passes
+```{r}
+# Step 1: Split into before and after tables
+before_tbl <- avg_runs %>%
+  filter(period == "Before ASB") %>%
+  select(team_name, avg_runs_before = avg_runs)
+
+after_tbl <- avg_runs %>%
+  filter(period == "After ASB") %>%
+  select(team_name, avg_runs_after = avg_runs)
+
+# Step 2: Join and compute difference
+diff_tbl <- left_join(after_tbl, before_tbl, by = "team_name") %>%
+  mutate(diff = avg_runs_after - avg_runs_before)
+
+# Step 3: Select top 5 up and down
+plot_tbl <- bind_rows(
+  diff_tbl %>% arrange(desc(diff)) %>% slice_head(n = 5),
+  diff_tbl %>% arrange(diff) %>% slice_head(n = 5)
+)
+
+plot_tbl2 <- bind_rows(
+  diff_tbl %>% arrange(desc(diff))
+)
+
+# Step 4: Plot
+ggplot(plot_tbl, aes(x = reorder(team_name, diff), y = diff, fill = diff > 0)) +
+  geom_col() +
+  geom_text(aes(label = round(diff, 2), vjust = ifelse(diff > 0, -0.5, 1.2)), size = 4) +
+  scale_fill_manual(values = c("firebrick3", "darkgreen"),
+                    labels = c("Decrease", "Increase")) +
+  labs(
+    title = "Change in Avg Runs Scored (After ASB - Before ASB)",
+    subtitle = paste("Top 5 Positive and Negative Run Differentials"),
+    x = "Team",
+    y = "Change in Avg Runs",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+  ) + 
+  ylim(-5, 7)
+
+```
+
+
+```{r}
+batter_team_avg <- batter_team_avg %>%
+  mutate(
+    highlight_color = case_when(
+      team_name %in% c("CWS", "CLE", "COL", "KC", "PHI") ~ "green",
+      team_name %in% c("BOS", "DET", "WSH", "MIA", "SEA") ~ "red",
+      TRUE ~ "gray"
+    )
+  )
+```
+
+```{r}
+ggplot(batter_team_avg, aes(x = avg_xba, y = avg_ba, label = team_name)) +
+  geom_point(aes(color = highlight_color), size = 1.8) +
+  scale_color_manual(values = c("red" = "firebrick3", "green" = "forestgreen", "gray" = "#002D72")) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  geom_text(vjust = -0.7, size = 2.5) +  
+  annotate("text", x = 0.2205, y = 0.27, label = "Overperforming", size = 4, fontface = "bold", color = "darkgreen") +
+  annotate("text", x = 0.264, y = 0.21, label = "Underperforming", size = 4, fontface = "bold", color = "firebrick3") +
+  labs(
+    title = "Team-Level: Batting Average vs Expected Batting Average",
+    subtitle = "Comparing Actual vs. Expected Batting Averages by Team",
+    x = "Expected Batting Average (xBA)",
+    y = "Actual Batting Average (BA)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    legend.position = "none"
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
