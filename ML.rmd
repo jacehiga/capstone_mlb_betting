@@ -1,0 +1,336 @@
+---
+title: "Data Analysis - Capstone"
+output: html_document
+date: "2025-07-18"
+---
+
+## Installing Packages to Connect to Postgres
+```{r}
+install.packages("DBI")
+install.packages("RPostgres")
+```
+
+## Connecting
+
+```{r cars}
+library(DBI)
+library(RPostgres)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = "switchyard.proxy.rlwy.net",   
+  port = 42251,
+  dbname = "railway",
+  user = "postgres",
+  password = "onfxNlZFioFScuucmNhZKHhzPggcMfvd"
+)
+```
+
+
+## R Libraries
+``` {r}
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+```
+
+```{r}
+games <- dbReadTable(con, "games")
+pitcher_stats <- dbReadTable(con, "pitcher_stats")
+batter_stats <- dbReadTable(con, "batter_stats")
+batter_statcast <- dbReadTable(con, "batter_statcast")
+batter_pitches <- dbReadTable(con, "batter_pitches")
+pitcher_statcast <- dbReadTable(con, "pitcher_statcast")
+pitcher_pitches <- dbReadTable(con, "pitcher_pitches")
+players <- dbReadTable(con, "players")
+sides <- dbReadTable(con, "sides")
+teams <- dbReadTable(con, "teams")
+```
+
+
+```{r}
+library(tidyverse)
+library(dplyr)
+
+# 1. Filter and join relievers
+relief_pitchers <- pitcher_stats %>%
+  filter(type != "SP") %>%
+  inner_join(sides, by = c("game_id", "team_id")) %>%
+  left_join(pitcher_statcast %>% select(-era), by = "pitcher_id")
+
+# 2. Compute average reliever stats per team per game
+reliever_averages <- relief_pitchers %>%
+  dplyr::group_by(game_id, team_id) %>%
+  summarise(
+    rp_era = mean(era, na.rm = TRUE),
+    rp_x_era = mean(x_era, na.rm = TRUE),
+    rp_slg = mean(slg, na.rm = TRUE),
+    rp_x_slg = mean(x_slg, na.rm = TRUE),
+    rp_x_ba = mean(x_ba, na.rm = TRUE),
+    rp_x_woba = mean(x_woba, na.rm = TRUE),
+    rp_ba = mean(ba, na.rm = TRUE),
+    rp_woba = mean(woba, na.rm = TRUE),
+    rp_pa = sum(pa, na.rm = TRUE),  # total plate appearances
+    .groups = "drop"
+  )
+
+# 3. Get total IP from all relievers per team per game
+reliever_ip <- pitcher_stats %>%
+  filter(type != "SP") %>%
+  dplyr::group_by(game_id, team_id) %>%
+  summarise(rp_ip = sum(ip, na.rm = TRUE), .groups = "drop")
+
+
+# 4. Prepare starting pitcher stats
+starting_pitchers <- pitcher_stats %>%
+  filter(type == "SP") %>%
+  inner_join(sides, by = c("game_id", "team_id")) %>%
+  left_join(pitcher_statcast %>% select(-era), by = "pitcher_id")
+
+# 5. Create final pitcher_game_stats
+pitcher_game_stats <- starting_pitchers %>%
+  inner_join(games, by = "game_id") %>%
+  filter(
+    (side == "home" & team_id == home_team_id) |
+    (side == "away" & team_id == away_team_id)
+  ) %>%
+  mutate(
+    total_runs = home_score + away_score,
+    over_4_5 = as.factor(ifelse(side == "home", home_score > 4.5, away_score > 4.5)),
+    runs_scored = ifelse(side == "home", home_score, away_score),
+    opponent_id = case_when(
+      side == "home" ~ away_team_id,
+      side == "away" ~ home_team_id
+    ),
+    sp_ip = ip  # <-- grab starting pitcher IP directly
+  ) %>%
+  rename_with(~ paste0("sp_", .), .cols = c(starts_with("x_"), starts_with("rv"), "era", "pa", "ba", "woba", "slg")) %>%
+  select(
+    game_id, side, team_id, opponent_id, pitcher_id,
+    sp_ip, sp_era, over_4_5, runs_scored,
+    starts_with("sp_")
+  ) %>%
+  # 6. Join reliever stats
+  left_join(reliever_averages, by = c("game_id", "team_id")) %>%
+  left_join(reliever_ip, by = c("game_id", "team_id"))
+```
+
+
+
+```{r}
+# 1. Combine batter stats and statcast
+batter_full <- batter_stats %>%
+  left_join(batter_statcast, by = "batter_id")
+
+# 2. Compute avg and sum batter stats per game/team
+avg_sum_batter_stats <- batter_full %>%
+  group_by(game_id, team_id) %>%
+  summarise(
+    # Averages
+    across(where(is.numeric), ~mean(.x, na.rm = TRUE), .names = "b_{.col}"),
+    
+    # Totals
+    across(where(is.numeric), ~sum(.x, na.rm = TRUE), .names = "b_sum_{.col}"),
+    
+    .groups = "drop"
+  )
+
+# Define which columns to sum and which to average
+sum_cols <- c("ab", "h", "bb", "r", "rbi", "so", "double", "triple", "hr", "sb")
+mean_cols <- c("ba", "x_ba", "woba", "x_woba", "slg", "x_slg")  # extend as needed
+
+# 3. Calculate both for each game/team combo
+batter_game_stats <- batter_full %>%
+  group_by(game_id, team_id) %>%
+  summarise(
+    across(all_of(sum_cols), ~sum(.x, na.rm = TRUE), .names = "b_sum_{.col}"),
+    across(all_of(mean_cols), ~mean(.x, na.rm = TRUE), .names = "b_{.col}"),
+    .groups = "drop"
+  )
+
+```
+
+
+```{r}
+## 1. Join with opponent's batter_game_stats
+model_data <- pitcher_game_stats %>%
+  left_join(batter_game_stats, by = c("game_id", "opponent_id" = "team_id"))
+```
+
+
+
+## Engineering Rolling Bating Average for last 5 Games
+```{r}
+#install.packages("slider")
+library(slider)
+
+# Add game_date to batter_stats
+batter_stats <- batter_stats %>%
+  left_join(games %>% select(game_id, date), by = "game_id")
+
+# Create batter-level game log with rolling batting average
+batter_game_log <- batter_stats %>%
+  arrange(team_id, date) %>%
+  group_by(team_id) %>%
+  mutate(
+    rolling_ab_5 = slide_dbl(ab, mean, .before = 5, .complete = TRUE),
+    rolling_h_5 = slide_dbl(h, mean, .before = 5, .complete = TRUE),
+    rolling_ba_5 = rolling_h_5 / rolling_ab_5
+  ) %>%
+  ungroup()
+
+# Add rolling batting average per team
+batter_rolling_stats <- batter_game_log %>%
+  group_by(game_id, team_id) %>%
+  summarise(
+    team_rolling_ba_5 = mean(rolling_ba_5, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+model_data <- model_data %>%
+  left_join(batter_rolling_stats, by = c("game_id", "opponent_id" = "team_id"))
+
+
+```
+
+
+## Engineering bullpen fatigue for 3 day Rollover
+```{r}
+# Total RP IP in the past 3 days
+reliever_usage <- pitcher_stats %>%
+  filter(type != "SP") %>%
+  left_join(games %>% select(game_id, date), by = "game_id") %>%
+  arrange(team_id, date) %>%
+  group_by(team_id) %>%
+  mutate(
+    rolling_rp_ip_3d = slide_dbl(lag(ip), sum, .before = 2, .complete = TRUE)
+  ) %>%
+  ungroup() %>%
+  select(game_id, team_id, rolling_rp_ip_3d)
+
+model_data <- model_data %>%
+  left_join(reliever_usage, by = c("game_id", "opponent_id" = "team_id"))
+```
+
+
+## Rolling average of runs 
+```{r}
+team_run_log <- games %>%
+  pivot_longer(c(home_team_id, away_team_id), names_to = "side", values_to = "team_id") %>%
+  mutate(
+    runs_scored = ifelse(side == "home_team_id", home_score, away_score)
+  ) %>%
+  arrange(team_id, date) %>%
+  group_by(team_id) %>%
+  mutate(rolling_runs_5 = slide_dbl(runs_scored, mean, .before = 4, .complete = TRUE)) %>%
+  ungroup()
+
+model_data <- model_data %>%
+  left_join(team_run_log %>% select(game_id, team_id, rolling_runs_5), by = c("game_id", "team_id"))
+```
+
+
+
+```{r}
+## Threshold for runs/hits
+```
+
+## Beginning ML
+```{r}
+library(caret)
+
+model_data <- model_data %>%
+  distinct(game_id, team_id, .keep_all = TRUE)
+
+
+
+model_data_clean <- na.omit(model_data) 
+
+model_data_clean <- model_data_clean %>%
+  select(-c(sp_pa, sp_ba, sp_x_slg, sp_x_era, rolling_rp_ip_3d, sp_ip, sp_slg, sp_x_woba))
+
+# Creating binary variable 
+model_data_clean = model_data_clean %>%
+  mutate(
+    over_4_5 = factor(ifelse(runs_scored > 4.5, "Yes", "No"), levels = c("No", "Yes"))
+  )
+
+# Taking out non-indicative variables
+model_data_clean = model_data_clean %>%
+  select(
+  -c(
+    game_id, team_id, opponent_id, pitcher_id, side, runs_scored,
+    starts_with("rp_"),
+    starts_with("b_sum_")
+  )
+)
+
+
+
+# Split data into training and testing
+set.seed(11)
+split <- createDataPartition(model_data_clean$over_4_5, p = 0.8, list = FALSE)
+train_data <- model_data_clean[split, ]
+test_data  <- model_data_clean[-split, ]
+```
+
+
+```{r}
+# Highly correlated predictors
+library(recipes)
+
+recipe_obj = recipe(over_4_5 ~ ., data = train_data) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9)
+```
+
+
+```{r}
+# Set up training for cross validation
+ctrl = trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE
+)
+
+
+# Train random forest model
+set.seed(4)
+rf_model <- train(
+  recipe_obj,
+  data = train_data,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",   
+  tuneLength = 5
+)
+```
+
+
+
+```{r}
+# Predict classes
+rf_preds = predict(rf_model, newdata = test_data)
+
+# Predict probabilities
+rf_probs = predict(rf_model, newdata = test_data, type = "prob")
+
+```
+
+
+```{r}
+# Confusion matrix
+confusionMatrix(rf_preds, test_data$over_4_5)
+
+# AUC / ROC
+library(pROC)
+roc_obj <- roc(test_data$over_4_5, rf_probs$Yes)
+auc(roc_obj)
+plot(roc_obj, main = "ROC Curve - RF")
+
+varImp(rf_model)
+```
